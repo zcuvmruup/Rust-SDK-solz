@@ -1,0 +1,172 @@
+// Import necessary libraries
+use solana_program::{
+    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey, program,
+    program_pack::Pack, system_instruction, sysvar,
+};
+
+// Define contract data structure
+#[repr(C)]
+pub struct LiquidityPool {
+    pub owner: Pubkey,
+    pub token_account: Pubkey, // Token account
+    pub total_liquidity: u64,
+    pub user_balances: Vec<(Pubkey, u64)>, // Individual user balances
+}
+
+// Program entry point
+#[entrypoint]
+fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    // Parse account information
+    let accounts_iter = &mut accounts.iter();
+    let pool_account = next_account_info(accounts_iter)?;
+
+    // Check if the correct program owns the contract
+    if pool_account.owner != program_id {
+        return Err(solana_program::program_error::ProgramError::IncorrectProgramId);
+    }
+
+    // Parse contract data
+    let mut pool_data = LiquidityPool::unpack(&pool_account.data.borrow())?;
+    
+    // Handle different operations based on the instruction
+    match instruction_data[0] {
+        0 => {
+            // Operation: Provide liquidity
+            provide_liquidity(accounts_iter, &mut pool_data, instruction_data)?;
+        },
+        1 => {
+            // Operation: Withdraw liquidity
+            withdraw_liquidity(accounts_iter, &mut pool_data, instruction_data)?;
+        },
+        2 => {
+            // Operation: Get user balance
+            get_user_balance(accounts_iter, &pool_data, instruction_data)?;
+        },
+        _ => {
+            // Invalid operation
+            return Err(solana_program::program_error::ProgramError::InvalidInstructionData);
+        }
+    }
+
+    // Update contract data
+    LiquidityPool::pack(pool_data, &mut pool_account.data.borrow_mut())?;
+
+    Ok(())
+}
+
+// Helper function: Provide liquidity
+fn provide_liquidity<'a, 'b>(
+    accounts_iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+    pool_data: &mut LiquidityPool,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let user_account = next_account_info(accounts_iter)?;
+    let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+
+    // Check if the user provided enough funds
+    let user_token_account = next_account_info(accounts_iter)?;
+    let token_balance = user_token_account.try_borrow_data()?;
+    let user_balance = u64::from_le_bytes(token_balance[0..8].try_into().unwrap());
+
+    if user_balance < amount {
+        return Err(solana_program::program_error::ProgramError::InsufficientFunds);
+    }
+
+    // Transfer funds to the contract account
+    let transfer_ix = system_instruction::transfer(user_account.key, &pool_data.token_account, amount);
+    solana_program::program::invoke(&[transfer_ix], accounts_iter)?;
+
+    // Update contract data
+    pool_data.total_liquidity += amount;
+
+    // Update individual user balance
+    let user_index = pool_data.user_balances.iter().position(|(user_key, _)| *user_key == *user_account.key);
+    match user_index {
+        Some(index) => pool_data.user_balances[index].1 += amount,
+        None => pool_data.user_balances.push((*user_account.key, amount)),
+    }
+
+    Ok(())
+}
+
+// Helper function: Withdraw liquidity
+fn withdraw_liquidity<'a, 'b>(
+    accounts_iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+    pool_data: &mut LiquidityPool,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let user_account = next_account_info(accounts_iter)?;
+    let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+
+    // Check if the contract has enough liquidity
+    if pool_data.total_liquidity < amount {
+        return Err(solana_program::program_error::ProgramError::InsufficientFunds);
+    }
+
+    // Transfer funds to the user account
+    let transfer_ix = system_instruction::transfer(&pool_data.token_account, user_account.key, amount);
+    solana_program::program::invoke(&[transfer_ix], accounts_iter)?;
+
+    // Update contract data
+    pool_data.total_liquidity -= amount;
+
+    // Update individual user balance
+    let user_index = pool_data.user_balances.iter().position(|(user_key, _)| *user_key == *user_account.key);
+    if let Some(index) = user_index {
+        pool_data.user_balances[index].1 -= amount;
+    }
+
+    Ok(())
+}
+
+// Helper function: Get user balance
+fn get_user_balance<'a, 'b>(
+    accounts_iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+    pool_data: &LiquidityPool,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let user_account = next_account_info(accounts_iter)?;
+
+    // Find user balance
+    let user_index = pool_data.user_balances.iter().position(|(user_key, _)| *user_key == *user_account.key);
+    let user_balance = match user_index {
+        Some(index) => pool_data.user_balances[index].1,
+        None => 0,
+    };
+
+    // Return user balance
+    let user_balance_bytes = user_balance.to_le_bytes();
+    user_account.data.borrow_mut()[0..8].copy_from_slice(&user_balance_bytes);
+
+    Ok(())
+}
+
+// Helper function: Parse account information
+fn next_account_info<'a, 'b>(
+    iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+) -> Result<&'a AccountInfo<'b>, ProgramResult> {
+    iter.next().ok_or_else(|| solana_program::program_error::ProgramError::NotEnoughAccountKeys)
+}
+
+// Helper function: Pack contract data into storage space
+impl Pack for LiquidityPool {
+    const LEN: usize = 40; // Increased size to accommodate user balances
+
+    fn unpack_from_slice(src: &[u8]) -> Result<Self, solana_program::program_error::ProgramError> {
+        let owner = Pubkey::new_from_array(<[u8; 32]>::try_from(&src[0..32]).unwrap());
+        let token_account = Pubkey::new_from_array(<[u8; 32]>::try_from(&src[32..64]).unwrap());
+        let total_liquidity = u64::from_le_bytes(src[64..72].try_into().unwrap());
+
+        // Parse user balances
+        let mut user_balances = Vec::new();
+        for i in (72..).step_by(40) {
+            if i + 40 <= src.len() {
+                let user_key = Pubkey::new_from_array(<[u8; 32]>::try_from(&src[i..i + 32]).unwrap());
+                let user_balance = u64::from_le_bytes(src[i + 32..i + 40].try_into().unwrap());
+                user_balances.push((user_key, user_balance));
+            } else {
+                break;
+            }
+        }
+
+        Ok
